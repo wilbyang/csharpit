@@ -1,33 +1,70 @@
-// Step 5: Make the pipeline async end-to-end.
+// Step 6: Middleware — cross-cutting behaviour that wraps the pipeline.
 //
 // C# features introduced:
-//   async / await
-//     `async` marks a method as asynchronous. `await` suspends it without
-//     blocking the thread — the thread is returned to the pool while waiting,
-//     then the method resumes when the result is ready. This is cooperative
-//     multitasking built into the language, not a library bolt-on.
+//   Higher-order functions (Func that accepts and returns a Func)
+//     A middleware is a function that takes the "next" handler and returns a
+//     new handler. Composed together they form a chain: each middleware decides
+//     whether to call next, when, and what to do with the result.
+//     This is exactly how ASP.NET Core's Use() / middleware pipeline works.
 //
-//   Task<T>
-//     The standard .NET promise type. Task<StepResult> means "a value of
-//     type StepResult that will be available in the future". The compiler
-//     rewrites async methods into a state machine automatically.
+//   Func<T, CancellationToken, Task<StepResult>> as a first-class type alias
+//     We give the delegate type a name (StepHandler<T>) via a delegate declaration
+//     so signatures stay readable instead of spelling out the full Func each time.
 //
-//   ValueTask<T>
-//     A lighter-weight alternative to Task<T> for hot paths that often
-//     complete synchronously (no allocation when no actual async work happens).
-//     IStep<T>.Execute returns ValueTask<StepResult> for this reason.
+//   LINQ (Aggregate / Reverse)
+//     Middleware is composed by folding the list from right to left with
+//     Aggregate — a functional reduce. The innermost handler is the pipeline
+//     runner; each middleware wraps it in turn.
 //
-//   ConfigureAwait(false)
-//     Tells the runtime not to marshal back to the original synchronization
-//     context after an await. Correct for library/framework code that has
-//     no UI thread to return to — avoids deadlocks in ASP.NET Classic and
-//     slightly reduces overhead everywhere.
+//   Lambda expressions capturing outer scope (closures)
+//     Each middleware lambda captures `next` from its parameter — the compiler
+//     generates a hidden class to hold the captured variable. This is what
+//     makes the chain work without manual plumbing.
+
+// ── Middleware definitions ─────────────────────────────────────────────────
+
+// 1. Timing middleware — measures wall-clock time for the whole pipeline.
+PipelineMiddleware<Order> timingMiddleware = async (order, ct, next) =>
+{
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    var result = await next(order, ct).ConfigureAwait(false);
+    Console.WriteLine($"[Timing] Pipeline finished in {sw.ElapsedMilliseconds} ms");
+    return result;
+};
+
+// 2. Logging middleware — prints entry/exit around every run.
+PipelineMiddleware<Order> loggingMiddleware = async (order, ct, next) =>
+{
+    Console.WriteLine($"[Log] Starting pipeline for order #{order.Id}");
+    var result = await next(order, ct).ConfigureAwait(false);
+    Console.WriteLine($"[Log] Pipeline ended — success: {result.IsSuccess}");
+    return result;
+};
+
+// 3. Error guard middleware — catches unhandled exceptions, returns a Fail result.
+PipelineMiddleware<Order> errorGuardMiddleware = async (order, ct, next) =>
+{
+    try
+    {
+        return await next(order, ct).ConfigureAwait(false);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[ErrorGuard] Unhandled exception: {ex.Message}");
+        return StepResult.Fail($"Unexpected error: {ex.Message}");
+    }
+};
+
+// ── Pipeline setup ─────────────────────────────────────────────────────────
 
 var pipeline = new Pipeline<Order>()
     .AddStep(new ValidateStep())
     .AddStep(new ApplyDiscountStep())
     .AddStep(new ChargePaymentStep())
-    .AddStep(new SendConfirmationStep());
+    .AddStep(new SendConfirmationStep())
+    .Use(errorGuardMiddleware)   // outermost — catches everything below it
+    .Use(loggingMiddleware)
+    .Use(timingMiddleware);      // innermost — closest to the actual steps
 
 var order = new Order
 {
@@ -41,14 +78,19 @@ Console.WriteLine($"Processing order #{order.Id}");
 var final = await pipeline.RunAsync(order);
 Console.WriteLine(final.IsSuccess ? $"Order #{order.Id} complete." : $"Order #{order.Id} failed.");
 
+// ── Delegate types ─────────────────────────────────────────────────────────
+
+// Named delegate for the step handler — avoids repeating the full Func signature.
+delegate Task<StepResult> StepHandler<T>(T payload, CancellationToken ct);
+
+// A middleware takes the next handler and returns a new (wrapping) handler.
+delegate Task<StepResult> PipelineMiddleware<T>(T payload, CancellationToken ct, StepHandler<T> next);
+
 // ── Step interface ─────────────────────────────────────────────────────────
 
 interface IStep<T>
 {
     string Name => GetType().Name;
-
-    // ValueTask<T> instead of Task<T>: zero allocation when the step
-    // completes synchronously (e.g. pure in-memory validation).
     ValueTask<StepResult> ExecuteAsync(T payload, CancellationToken ct = default);
 }
 
@@ -56,7 +98,6 @@ interface IStep<T>
 
 class ValidateStep : IStep<Order>
 {
-    // Synchronous logic — wrap in ValueTask.FromResult, no allocation overhead.
     public ValueTask<StepResult> ExecuteAsync(Order order, CancellationToken ct)
     {
         if (string.IsNullOrEmpty(order.CustomerEmail))
@@ -91,10 +132,7 @@ class ChargePaymentStep : IStep<Order>
     public async ValueTask<StepResult> ExecuteAsync(Order order, CancellationToken ct)
     {
         Console.WriteLine($"Charging {order.TotalAmount:C} to {order.CustomerEmail}...");
-
-        // Simulate async I/O (real impl would await an HTTP call here).
         await Task.Delay(50, ct).ConfigureAwait(false);
-
         Console.WriteLine("Payment charged.");
         return StepResult.Ok();
     }
@@ -107,9 +145,7 @@ class SendConfirmationStep : IStep<Order>
     public async ValueTask<StepResult> ExecuteAsync(Order order, CancellationToken ct)
     {
         Console.WriteLine($"Sending confirmation to {order.CustomerEmail}...");
-
         await Task.Delay(30, ct).ConfigureAwait(false);
-
         Console.WriteLine("Email sent.");
         return StepResult.Ok();
     }
@@ -120,40 +156,42 @@ class SendConfirmationStep : IStep<Order>
 class Pipeline<T>
 {
     private readonly List<IStep<T>> _steps = [];
+    private readonly List<PipelineMiddleware<T>> _middleware = [];
 
-    public Pipeline<T> AddStep(IStep<T> step)
-    {
-        _steps.Add(step);
-        return this;
-    }
+    public Pipeline<T> AddStep(IStep<T> step)          { _steps.Add(step);      return this; }
+    public Pipeline<T> Use(PipelineMiddleware<T> mw)    { _middleware.Add(mw);   return this; }
 
-    public Pipeline<T> AddStep(string name, Func<T, CancellationToken, ValueTask<StepResult>> func)
+    public Task<StepResult> RunAsync(T payload, CancellationToken ct = default)
     {
-        _steps.Add(new DelegateStep<T>(name, func));
-        return this;
-    }
-
-    public async Task<StepResult> RunAsync(T payload, CancellationToken ct = default)
-    {
-        foreach (var step in _steps)
+        // The innermost handler: run all steps in order.
+        StepHandler<T> inner = async (p, token) =>
         {
-            var result = await step.ExecuteAsync(payload, ct).ConfigureAwait(false);
-            if (result is { IsSuccess: false })
+            foreach (var step in _steps)
             {
-                Console.WriteLine($"[{step.Name}] ABORTED: {result.Error}");
-                return result;
+                var result = await step.ExecuteAsync(p, token).ConfigureAwait(false);
+                if (result is { IsSuccess: false })
+                {
+                    Console.WriteLine($"[{step.Name}] ABORTED: {result.Error}");
+                    return result;
+                }
             }
-        }
-        return StepResult.Ok();
+            return StepResult.Ok();
+        };
+
+        // Fold middleware from right to left so the first .Use() call ends up
+        // outermost (called first). Each layer wraps the previous handler.
+        //
+        // [errorGuard, logging, timing] folded right-to-left:
+        //   timing(logging(errorGuard(inner)))
+        // Execution order: timing → logging → errorGuard → inner → unwind
+        var handler = _middleware
+            .Reverse<PipelineMiddleware<T>>()
+            .Aggregate(inner, (next, mw) => (p, token) => mw(p, token, next));
+
+        return handler(payload, ct);
     }
 
     public IReadOnlyList<IStep<T>> Steps => _steps.AsReadOnly();
-}
-
-class DelegateStep<T>(string name, Func<T, CancellationToken, ValueTask<StepResult>> func) : IStep<T>
-{
-    public string Name => name;
-    public ValueTask<StepResult> ExecuteAsync(T payload, CancellationToken ct) => func(payload, ct);
 }
 
 // ── Supporting types ───────────────────────────────────────────────────────
