@@ -1,20 +1,27 @@
-// Step 4: Promote steps to first-class objects via IStep<T>.
+// Step 5: Make the pipeline async end-to-end.
 //
 // C# features introduced:
-//   interface
-//     Defines a contract — any class that implements IStep<T> can be added
-//     to the pipeline. The pipeline depends on the abstraction, not any
-//     specific implementation. This is the Dependency Inversion principle
-//     in its most direct C# form.
+//   async / await
+//     `async` marks a method as asynchronous. `await` suspends it without
+//     blocking the thread — the thread is returned to the pool while waiting,
+//     then the method resumes when the result is ready. This is cooperative
+//     multitasking built into the language, not a library bolt-on.
 //
-//   default interface member (Name property with a default)
-//     C# 8+ allows interfaces to provide a default implementation.
-//     Here, Name defaults to the class name via GetType().Name, so simple
-//     steps don't need to override it — only steps that want a custom label.
+//   Task<T>
+//     The standard .NET promise type. Task<StepResult> means "a value of
+//     type StepResult that will be available in the future". The compiler
+//     rewrites async methods into a state machine automatically.
 //
-//   Overloaded AddStep
-//     AddStep now accepts either an IStep<T> object or a raw Func<T, StepResult>
-//     delegate (from the previous step). Both overloads work — no call sites break.
+//   ValueTask<T>
+//     A lighter-weight alternative to Task<T> for hot paths that often
+//     complete synchronously (no allocation when no actual async work happens).
+//     IStep<T>.Execute returns ValueTask<StepResult> for this reason.
+//
+//   ConfigureAwait(false)
+//     Tells the runtime not to marshal back to the original synchronization
+//     context after an await. Correct for library/framework code that has
+//     no UI thread to return to — avoids deadlocks in ASP.NET Classic and
+//     slightly reduces overhead everywhere.
 
 var pipeline = new Pipeline<Order>()
     .AddStep(new ValidateStep())
@@ -31,33 +38,34 @@ var order = new Order
 };
 
 Console.WriteLine($"Processing order #{order.Id}");
-var final = pipeline.Run(order);
+var final = await pipeline.RunAsync(order);
 Console.WriteLine(final.IsSuccess ? $"Order #{order.Id} complete." : $"Order #{order.Id} failed.");
 
 // ── Step interface ─────────────────────────────────────────────────────────
 
 interface IStep<T>
 {
-    // Default implementation: use the class name as the label.
-    // Implementors can override this to provide a friendlier name.
     string Name => GetType().Name;
 
-    StepResult Execute(T payload);
+    // ValueTask<T> instead of Task<T>: zero allocation when the step
+    // completes synchronously (e.g. pure in-memory validation).
+    ValueTask<StepResult> ExecuteAsync(T payload, CancellationToken ct = default);
 }
 
 // ── Step implementations ───────────────────────────────────────────────────
 
 class ValidateStep : IStep<Order>
 {
-    public StepResult Execute(Order order)
+    // Synchronous logic — wrap in ValueTask.FromResult, no allocation overhead.
+    public ValueTask<StepResult> ExecuteAsync(Order order, CancellationToken ct)
     {
         if (string.IsNullOrEmpty(order.CustomerEmail))
-            return StepResult.Fail("Missing customer email.");
+            return ValueTask.FromResult(StepResult.Fail("Missing customer email."));
         if (order.Items.Count == 0)
-            return StepResult.Fail("Order has no items.");
+            return ValueTask.FromResult(StepResult.Fail("Order has no items."));
 
         Console.WriteLine("Validated.");
-        return StepResult.Ok();
+        return ValueTask.FromResult(StepResult.Ok());
     }
 }
 
@@ -65,14 +73,14 @@ class ApplyDiscountStep : IStep<Order>
 {
     public string Name => "Apply Discount";
 
-    public StepResult Execute(Order order)
+    public ValueTask<StepResult> ExecuteAsync(Order order, CancellationToken ct)
     {
         if (order.TotalAmount > 100)
         {
             order.TotalAmount *= 0.9m;
             Console.WriteLine($"Discount applied. New total: {order.TotalAmount:C}");
         }
-        return StepResult.Ok();
+        return ValueTask.FromResult(StepResult.Ok());
     }
 }
 
@@ -80,9 +88,13 @@ class ChargePaymentStep : IStep<Order>
 {
     public string Name => "Charge Payment";
 
-    public StepResult Execute(Order order)
+    public async ValueTask<StepResult> ExecuteAsync(Order order, CancellationToken ct)
     {
         Console.WriteLine($"Charging {order.TotalAmount:C} to {order.CustomerEmail}...");
+
+        // Simulate async I/O (real impl would await an HTTP call here).
+        await Task.Delay(50, ct).ConfigureAwait(false);
+
         Console.WriteLine("Payment charged.");
         return StepResult.Ok();
     }
@@ -92,9 +104,12 @@ class SendConfirmationStep : IStep<Order>
 {
     public string Name => "Send Confirmation";
 
-    public StepResult Execute(Order order)
+    public async ValueTask<StepResult> ExecuteAsync(Order order, CancellationToken ct)
     {
         Console.WriteLine($"Sending confirmation to {order.CustomerEmail}...");
+
+        await Task.Delay(30, ct).ConfigureAwait(false);
+
         Console.WriteLine("Email sent.");
         return StepResult.Ok();
     }
@@ -106,26 +121,23 @@ class Pipeline<T>
 {
     private readonly List<IStep<T>> _steps = [];
 
-    // Accept a full IStep<T> object.
     public Pipeline<T> AddStep(IStep<T> step)
     {
         _steps.Add(step);
         return this;
     }
 
-    // Still accept a raw delegate — wraps it in an anonymous IStep<T> so
-    // both overloads feed the same internal list. No call sites break.
-    public Pipeline<T> AddStep(string name, Func<T, StepResult> func)
+    public Pipeline<T> AddStep(string name, Func<T, CancellationToken, ValueTask<StepResult>> func)
     {
         _steps.Add(new DelegateStep<T>(name, func));
         return this;
     }
 
-    public StepResult Run(T payload)
+    public async Task<StepResult> RunAsync(T payload, CancellationToken ct = default)
     {
         foreach (var step in _steps)
         {
-            var result = step.Execute(payload);
+            var result = await step.ExecuteAsync(payload, ct).ConfigureAwait(false);
             if (result is { IsSuccess: false })
             {
                 Console.WriteLine($"[{step.Name}] ABORTED: {result.Error}");
@@ -135,15 +147,13 @@ class Pipeline<T>
         return StepResult.Ok();
     }
 
-    // Expose the registered steps for inspection / tooling.
     public IReadOnlyList<IStep<T>> Steps => _steps.AsReadOnly();
 }
 
-// Adapter that lets a delegate satisfy the IStep<T> contract.
-class DelegateStep<T>(string name, Func<T, StepResult> func) : IStep<T>
+class DelegateStep<T>(string name, Func<T, CancellationToken, ValueTask<StepResult>> func) : IStep<T>
 {
     public string Name => name;
-    public StepResult Execute(T payload) => func(payload);
+    public ValueTask<StepResult> ExecuteAsync(T payload, CancellationToken ct) => func(payload, ct);
 }
 
 // ── Supporting types ───────────────────────────────────────────────────────
