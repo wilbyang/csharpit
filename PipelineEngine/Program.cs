@@ -1,5 +1,12 @@
-﻿// Naive version: a simple order processing pipeline.
-// No abstractions yet — just plain sequential logic in a method.
+﻿// Step 1: Extract each processing step into its own method.
+// Steps are stored as Action<Order> delegates in a list and executed in order.
+//
+// C# feature: delegates (Action<T>) — a method is a first-class value.
+// You can store it in a variable, put it in a list, and call it later.
+// This decouples the pipeline runner from the step implementations.
+//
+// Limitation still present: steps can't signal failure — the runner has no
+// way to know a step failed and abort early. That's solved in Step 2.
 
 var order = new Order
 {
@@ -9,43 +16,52 @@ var order = new Order
     TotalAmount = 149.99m
 };
 
-ProcessOrder(order);
+// The pipeline is now a list of delegates — easy to add, remove, or reorder.
+List<Action<Order>> steps =
+[
+    Validate,
+    ApplyDiscount,
+    ChargePayment,
+    SendConfirmationEmail,
+];
 
-static void ProcessOrder(Order order)
+Console.WriteLine($"Processing order #{order.Id}");
+foreach (var step in steps)
+    step(order);
+Console.WriteLine($"Order #{order.Id} complete.");
+
+// Each step is now an independent, named, testable method.
+
+static void Validate(Order order)
 {
-    Console.WriteLine($"Processing order #{order.Id}");
-
-    // Step 1: Validate
     if (string.IsNullOrEmpty(order.CustomerEmail))
-    {
         Console.WriteLine("FAILED: Missing customer email.");
-        return;
-    }
-    if (order.Items.Count == 0)
-    {
+    else if (order.Items.Count == 0)
         Console.WriteLine("FAILED: Order has no items.");
-        return;
-    }
-    Console.WriteLine("Validated.");
+    else
+        Console.WriteLine("Validated.");
+    // Problem: we printed the failure but execution continues anyway.
+}
 
-    // Step 2: Apply discount
+static void ApplyDiscount(Order order)
+{
     if (order.TotalAmount > 100)
     {
-        order.TotalAmount *= 0.9m; // 10% discount
+        order.TotalAmount *= 0.9m;
         Console.WriteLine($"Discount applied. New total: {order.TotalAmount:C}");
     }
+}
 
-    // Step 3: Charge payment
+static void ChargePayment(Order order)
+{
     Console.WriteLine($"Charging {order.TotalAmount:C} to {order.CustomerEmail}...");
-    // (imagine a real payment call here)
     Console.WriteLine("Payment charged.");
+}
 
-    // Step 4: Send confirmation email
+static void SendConfirmationEmail(Order order)
+{
     Console.WriteLine($"Sending confirmation to {order.CustomerEmail}...");
-    // (imagine a real email call here)
     Console.WriteLine("Email sent.");
-
-    Console.WriteLine($"Order #{order.Id} complete.");
 }
 
 class Order
