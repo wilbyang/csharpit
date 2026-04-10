@@ -1,24 +1,26 @@
-// Step 3: Wrap the list + runner into a generic Pipeline<T> class.
+// Step 4: Promote steps to first-class objects via IStep<T>.
 //
 // C# features introduced:
-//   Generics (Pipeline<T>, Func<T, StepResult>)
-//     The pipeline knows nothing about Order specifically. T is the payload
-//     type — swap Order for Invoice, Request, anything. The compiler enforces
-//     type safety at the call site with zero runtime overhead.
+//   interface
+//     Defines a contract — any class that implements IStep<T> can be added
+//     to the pipeline. The pipeline depends on the abstraction, not any
+//     specific implementation. This is the Dependency Inversion principle
+//     in its most direct C# form.
 //
-//   Fluent builder pattern (method returns `this`)
-//     AddStep() returns the Pipeline<T> instance so calls can be chained.
-//     This is idiomatic C# — LINQ, StringBuilder, and most modern APIs use it.
+//   default interface member (Name property with a default)
+//     C# 8+ allows interfaces to provide a default implementation.
+//     Here, Name defaults to the class name via GetType().Name, so simple
+//     steps don't need to override it — only steps that want a custom label.
 //
-//   Tuple deconstruction in foreach
-//     Each step is stored as a (string Name, Func<T, StepResult> Execute) tuple.
-//     The foreach deconstructs it inline: `var (name, execute) in _steps`.
+//   Overloaded AddStep
+//     AddStep now accepts either an IStep<T> object or a raw Func<T, StepResult>
+//     delegate (from the previous step). Both overloads work — no call sites break.
 
 var pipeline = new Pipeline<Order>()
-    .AddStep("Validate",          Validate)
-    .AddStep("Apply discount",    ApplyDiscount)
-    .AddStep("Charge payment",    ChargePayment)
-    .AddStep("Send confirmation", SendConfirmationEmail);
+    .AddStep(new ValidateStep())
+    .AddStep(new ApplyDiscountStep())
+    .AddStep(new ChargePaymentStep())
+    .AddStep(new SendConfirmationStep());
 
 var order = new Order
 {
@@ -32,73 +34,119 @@ Console.WriteLine($"Processing order #{order.Id}");
 var final = pipeline.Run(order);
 Console.WriteLine(final.IsSuccess ? $"Order #{order.Id} complete." : $"Order #{order.Id} failed.");
 
-// ── Steps ─────────────────────────────────────────────────────────────────
+// ── Step interface ─────────────────────────────────────────────────────────
 
-static StepResult Validate(Order order)
+interface IStep<T>
 {
-    if (string.IsNullOrEmpty(order.CustomerEmail))
-        return StepResult.Fail("Missing customer email.");
-    if (order.Items.Count == 0)
-        return StepResult.Fail("Order has no items.");
+    // Default implementation: use the class name as the label.
+    // Implementors can override this to provide a friendlier name.
+    string Name => GetType().Name;
 
-    Console.WriteLine("Validated.");
-    return StepResult.Ok();
+    StepResult Execute(T payload);
 }
 
-static StepResult ApplyDiscount(Order order)
+// ── Step implementations ───────────────────────────────────────────────────
+
+class ValidateStep : IStep<Order>
 {
-    if (order.TotalAmount > 100)
+    public StepResult Execute(Order order)
     {
-        order.TotalAmount *= 0.9m;
-        Console.WriteLine($"Discount applied. New total: {order.TotalAmount:C}");
+        if (string.IsNullOrEmpty(order.CustomerEmail))
+            return StepResult.Fail("Missing customer email.");
+        if (order.Items.Count == 0)
+            return StepResult.Fail("Order has no items.");
+
+        Console.WriteLine("Validated.");
+        return StepResult.Ok();
     }
-    return StepResult.Ok();
 }
 
-static StepResult ChargePayment(Order order)
+class ApplyDiscountStep : IStep<Order>
 {
-    Console.WriteLine($"Charging {order.TotalAmount:C} to {order.CustomerEmail}...");
-    Console.WriteLine("Payment charged.");
-    return StepResult.Ok();
+    public string Name => "Apply Discount";
+
+    public StepResult Execute(Order order)
+    {
+        if (order.TotalAmount > 100)
+        {
+            order.TotalAmount *= 0.9m;
+            Console.WriteLine($"Discount applied. New total: {order.TotalAmount:C}");
+        }
+        return StepResult.Ok();
+    }
 }
 
-static StepResult SendConfirmationEmail(Order order)
+class ChargePaymentStep : IStep<Order>
 {
-    Console.WriteLine($"Sending confirmation to {order.CustomerEmail}...");
-    Console.WriteLine("Email sent.");
-    return StepResult.Ok();
+    public string Name => "Charge Payment";
+
+    public StepResult Execute(Order order)
+    {
+        Console.WriteLine($"Charging {order.TotalAmount:C} to {order.CustomerEmail}...");
+        Console.WriteLine("Payment charged.");
+        return StepResult.Ok();
+    }
 }
 
-// ── Types ─────────────────────────────────────────────────────────────────
+class SendConfirmationStep : IStep<Order>
+{
+    public string Name => "Send Confirmation";
 
-// Pipeline<T>: owns the step list and the runner logic.
-// T is unconstrained — add `where T : class` later if needed.
+    public StepResult Execute(Order order)
+    {
+        Console.WriteLine($"Sending confirmation to {order.CustomerEmail}...");
+        Console.WriteLine("Email sent.");
+        return StepResult.Ok();
+    }
+}
+
+// ── Pipeline ───────────────────────────────────────────────────────────────
+
 class Pipeline<T>
 {
-    // Tuple list: pairs a human-readable name with the step delegate.
-    private readonly List<(string Name, Func<T, StepResult> Execute)> _steps = [];
+    private readonly List<IStep<T>> _steps = [];
 
-    // Returns `this` so calls chain fluently.
-    public Pipeline<T> AddStep(string name, Func<T, StepResult> step)
+    // Accept a full IStep<T> object.
+    public Pipeline<T> AddStep(IStep<T> step)
     {
-        _steps.Add((name, step));
+        _steps.Add(step);
+        return this;
+    }
+
+    // Still accept a raw delegate — wraps it in an anonymous IStep<T> so
+    // both overloads feed the same internal list. No call sites break.
+    public Pipeline<T> AddStep(string name, Func<T, StepResult> func)
+    {
+        _steps.Add(new DelegateStep<T>(name, func));
         return this;
     }
 
     public StepResult Run(T payload)
     {
-        foreach (var (name, execute) in _steps)
+        foreach (var step in _steps)
         {
-            var result = execute(payload);
+            var result = step.Execute(payload);
             if (result is { IsSuccess: false })
             {
-                Console.WriteLine($"[{name}] ABORTED: {result.Error}");
+                Console.WriteLine($"[{step.Name}] ABORTED: {result.Error}");
                 return result;
             }
         }
         return StepResult.Ok();
     }
+
+    // Expose the registered steps for inspection / tooling.
+    public IReadOnlyList<IStep<T>> Steps => _steps.AsReadOnly();
 }
+
+// Adapter that lets a delegate satisfy the IStep<T> contract.
+class DelegateStep<T>(string name, Func<T, StepResult> func) : IStep<T>
+{
+    public string Name => name;
+    public StepResult Execute(T payload) => func(payload);
+}
+
+// ── Supporting types ───────────────────────────────────────────────────────
 
 record StepResult(bool IsSuccess, string? Error = null)
 {
