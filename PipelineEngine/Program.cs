@@ -1,12 +1,14 @@
-﻿// Step 1: Extract each processing step into its own method.
-// Steps are stored as Action<Order> delegates in a list and executed in order.
+﻿// Step 2: Steps now return a StepResult so the runner can abort early.
 //
-// C# feature: delegates (Action<T>) — a method is a first-class value.
-// You can store it in a variable, put it in a list, and call it later.
-// This decouples the pipeline runner from the step implementations.
-//
-// Limitation still present: steps can't signal failure — the runner has no
-// way to know a step failed and abort early. That's solved in Step 2.
+// C# features introduced:
+//   record        — an immutable value type with structural equality and
+//                   a compact declaration syntax. Perfect for result objects
+//                   that are created once and never mutated.
+//   static members on records — Ok() and Fail() are factory methods that
+//                   live on the type itself, keeping call sites readable.
+//   pattern matching (switch expression) — the runner inspects the result
+//                   with `result is { IsSuccess: false }` instead of
+//                   branching on an enum or checking a bool + string pair.
 
 var order = new Order
 {
@@ -16,8 +18,7 @@ var order = new Order
     TotalAmount = 149.99m
 };
 
-// The pipeline is now a list of delegates — easy to add, remove, or reorder.
-List<Action<Order>> steps =
+List<Func<Order, StepResult>> steps =
 [
     Validate,
     ApplyDiscount,
@@ -27,41 +28,59 @@ List<Action<Order>> steps =
 
 Console.WriteLine($"Processing order #{order.Id}");
 foreach (var step in steps)
-    step(order);
-Console.WriteLine($"Order #{order.Id} complete.");
-
-// Each step is now an independent, named, testable method.
-
-static void Validate(Order order)
 {
-    if (string.IsNullOrEmpty(order.CustomerEmail))
-        Console.WriteLine("FAILED: Missing customer email.");
-    else if (order.Items.Count == 0)
-        Console.WriteLine("FAILED: Order has no items.");
-    else
-        Console.WriteLine("Validated.");
-    // Problem: we printed the failure but execution continues anyway.
+    var result = step(order);
+    if (result is { IsSuccess: false })
+    {
+        Console.WriteLine($"ABORTED: {result.Error}");
+        break; // runner stops — no more steps run
+    }
 }
 
-static void ApplyDiscount(Order order)
+// ── Steps ─────────────────────────────────────────────────────────────────
+
+static StepResult Validate(Order order)
+{
+    if (string.IsNullOrEmpty(order.CustomerEmail))
+        return StepResult.Fail("Missing customer email.");
+    if (order.Items.Count == 0)
+        return StepResult.Fail("Order has no items.");
+
+    Console.WriteLine("Validated.");
+    return StepResult.Ok();
+}
+
+static StepResult ApplyDiscount(Order order)
 {
     if (order.TotalAmount > 100)
     {
         order.TotalAmount *= 0.9m;
         Console.WriteLine($"Discount applied. New total: {order.TotalAmount:C}");
     }
+    return StepResult.Ok();
 }
 
-static void ChargePayment(Order order)
+static StepResult ChargePayment(Order order)
 {
     Console.WriteLine($"Charging {order.TotalAmount:C} to {order.CustomerEmail}...");
     Console.WriteLine("Payment charged.");
+    return StepResult.Ok();
 }
 
-static void SendConfirmationEmail(Order order)
+static StepResult SendConfirmationEmail(Order order)
 {
     Console.WriteLine($"Sending confirmation to {order.CustomerEmail}...");
     Console.WriteLine("Email sent.");
+    return StepResult.Ok();
+}
+
+// ── Types must come after all top-level statements and local functions ────
+
+// `record` gives us: constructor, ToString, ==, and immutability for free.
+record StepResult(bool IsSuccess, string? Error = null)
+{
+    public static StepResult Ok()           => new(true);
+    public static StepResult Fail(string e) => new(false, e);
 }
 
 class Order
